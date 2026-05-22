@@ -1,0 +1,13 @@
+# Skill-Link-Cdo-ML / render.yaml
+# Render deployment configuration for the ML Matching Service.
+
+services:
+  - type: web
+    name: skilllink-ml
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health/
+    envVars:
+      - key: SERVICE_API_KEY
+        sync: false
