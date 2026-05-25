@@ -1,223 +1,231 @@
 # Skill-Link-Cdo-ML / matcher/engine.py
 #
-# Core Matching Engine — Skill-Link CDO ML Service
+# Matching signals (v2 — updated per scope discussion):
+#   1. Text relevance  — TF-IDF on job_type name + resident notes vs worker bio
+#                        Bio is optional; empty bio gets neutral score (not excluded)
+#   2. Proximity       — Haversine distance, exponential decay
+#   3. Price           — budget range vs declared_rate, linear decay outside range
+#   4. Rating          — avg_rating 0-5 normalized; new workers get neutral 0.5
+#   5. Experience      — years_experience, square-root curve capped at config value
 #
-# MODEL: Hybrid Content-Based Recommender Model
-# -----------------------------------------------
-#
-# This is a Weighted Linear Combination Model — the standard baseline
-# for hybrid recommender systems (Ricci et al., 2022).
+# Weights live in config.py — no code changes needed to re-tune.
+
 
 from __future__ import annotations
 import math
-import re
 import logging
- 
+from typing import Any
+
+import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
- 
 from config import (
-    WEIGHT_TEXT,
-    WEIGHT_PROXIMITY,
-    WEIGHT_PRICE,
-    WEIGHT_RATING,
-    MAX_PROXIMITY_KM,
-    FALLBACK_TEXT_SCORE,
+    WEIGHT_TEXT, WEIGHT_PROXIMITY, WEIGHT_PRICE,
+    WEIGHT_RATING, WEIGHT_EXPERIENCE,
+    PROXIMITY_DECAY_KM, EXPERIENCE_CAP_YEARS,
 )
-from matcher.schema import JobRequestPayload, CandidateWorker, RankedWorker
- 
-logger = logging.getLogger("skilllink-ml.engine")
- 
-_EARTH_RADIUS_KM = 6371.0
- 
- 
-# Text normalization
- 
-def normalize_text(text: str) -> str:
-    """
-    Lowercase, remove punctuation, collapse whitespace.
-    """
-    if not text or not text.strip():
-        return ""
-    text = text.lower()
-    text = re.sub(r"[^a-z0-9\s]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
- 
- 
-# Signal 1: TF-IDF + Cosine Similarity
- 
-def compute_text_scores(query: str, bios: list[str]) -> list[float]:
-    """
-    Vectorizes the job description (query) and all worker bios using TF-IDF,
-    then computes Cosine Similarity between the query and each bio vector.
- 
-    Returns a list of float scores in [0.0, 1.0], one per candidate.
-    """
-    has_content = any(b.strip() for b in bios)
-    if not has_content:
-        logger.warning(
-            "All candidate bios are empty. Applying fallback text score %.2f.",
-            FALLBACK_TEXT_SCORE,
-        )
-        return [FALLBACK_TEXT_SCORE] * len(bios)
- 
-    corpus = [query] + bios
- 
-    vectorizer = TfidfVectorizer(
-        stop_words="english",
-        ngram_range=(1, 2),
-        min_df=1,
-        sublinear_tf=True,
-    )
-    tfidf_matrix = vectorizer.fit_transform(corpus)
- 
-    query_vector = tfidf_matrix[0]
-    bio_vectors  = tfidf_matrix[1:]
- 
-    scores = cosine_similarity(query_vector, bio_vectors).flatten()
-    return scores.tolist()
- 
- 
-# Signal 2: Haversine Proximity
- 
-def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
-    """
-    Computes the great-circle distance in km between two coordinates.
-    Uses the Haversine formula which accounts for Earth's curvature.
-    """
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
+
+logger = logging.getLogger(__name__)
+
+
+# ── Haversine ──────────────────────────────────────────────────────────────────
+
+def _haversine_km(lat1, lng1, lat2, lng2):
+    R = 6371.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
     dphi    = math.radians(lat2 - lat1)
     dlambda = math.radians(lng2 - lng1)
- 
-    a = (
-        math.sin(dphi / 2) ** 2
-        + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
-    )
-    return 2 * _EARTH_RADIUS_KM * math.asin(math.sqrt(a))
- 
- 
-def proximity_score(distance_km: float) -> float:
-    """
-    Converts distance to a [0, 1]
-    """
-    return max(0.0, 1.0 - distance_km / MAX_PROXIMITY_KM)
- 
- 
-# Signal 3: Price Compatibility
- 
-def price_score(
-    declared_rate: float,
-    budget_min: float | None,
-    budget_max: float | None,
-) -> float:
-    """
-    Scores how well the worker's declared rate fits the resident's
-    selected budget range.
- 
-    - No budget specified → 0.5 (neutral; budget is not a factor)
-    - Rate within [budget_min, budget_max] → 1.0 (perfect fit)
-    - Rate below budget_min → gentle penalty (may still be acceptable)
-    - Rate above budget_max → stronger penalty (resident likely cannot afford)
-    """
-    if budget_min is None and budget_max is None:
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+# ── Signal scorers ─────────────────────────────────────────────────────────────
+
+def _proximity_score(job_lat, job_lng, w_lat, w_lng):
+    """Exponential decay: score = e^(-km / decay_km). Neutral 0.5 if no coords."""
+    if w_lat is None or w_lng is None or job_lat is None or job_lng is None:
         return 0.5
- 
-    lo = budget_min if budget_min is not None else 0.0
-    hi = budget_max if budget_max is not None else float("inf")
- 
-    if lo <= declared_rate <= hi:
+    try:
+        km = _haversine_km(float(job_lat), float(job_lng), float(w_lat), float(w_lng))
+        return round(math.exp(-km / PROXIMITY_DECAY_KM), 4)
+    except Exception:
+        return 0.5
+
+
+def _price_score(budget_min, budget_max, declared_rate):
+    """
+    1.0  inside range.
+    Linear decay outside — how far the rate is outside expressed as a
+    fraction of the range width. No budget supplied → neutral 0.5.
+    """
+    if budget_min is None or budget_max is None:
+        return 0.5
+    if budget_min <= declared_rate <= budget_max:
         return 1.0
- 
-    if declared_rate < lo:
-        penalty = min((lo - declared_rate) / max(lo, 1.0), 1.0)
-        return max(0.0, 0.7 - 0.7 * penalty)
- 
-    # Above budget_max
-    penalty = min((declared_rate - hi) / max(hi, 1.0), 1.0)
-    return max(0.0, 1.0 - penalty)
- 
- 
-# Signal 4: Average Rating
- 
-def rating_score(avg_rating: float) -> float:
+    band = max(float(budget_max) - float(budget_min), 1.0)
+    dist = (float(budget_min) - declared_rate
+            if declared_rate < float(budget_min)
+            else declared_rate - float(budget_max))
+    return round(max(0.0, 1.0 - dist / band), 4)
+
+
+def _rating_score(avg_rating):
     """
-    Normalizes WorkerProfile.avg_rating (0.00–5.00) to [0.0, 1.0].
- 
-    Workers with avg_rating == 0.0 have no reviews yet (new workers).
-    They receive 0.5 (neutral) instead of 0.0 to avoid unfairly
-    penalizing newly registered workers.
+    Normalize 0-5 to 0-1.
+    Workers with no ratings yet (0.0) receive 0.5 so they are not
+    penalised before accumulating reviews.
     """
-    if avg_rating == 0.0:
+    if avg_rating <= 0:
         return 0.5
-    return avg_rating / 5.0
- 
- 
-# Main entry point
- 
-def run_matching(
-    job: JobRequestPayload,
-    candidates: list[CandidateWorker],
-) -> list[RankedWorker]:
+    return round(min(float(avg_rating) / 5.0, 1.0), 4)
+
+
+def _experience_score(years):
     """
-    Runs the full matching pipeline and returns workers ranked by
-    composite score descending.
- 
-    Pipeline:
-      1. Normalize query text and all worker bios.
-      2. Compute TF-IDF cosine similarity scores.
-      3. For each candidate, compute proximity, price, rating scores.
-      4. Combine with Weighted Linear Combination.
-      5. Sort descending and return.
+    Square-root curve capped at EXPERIENCE_CAP_YEARS.
+
+    Early years carry strong weight; diminishing returns beyond the cap.
+    This reflects real-world relevance — a 10-year worker is not twice
+    as capable as a 5-year worker for a routine job.
+
+    At cap = 10 years:
+        0 yrs  → 0.00   5 yrs → 0.71
+        1 yr   → 0.32  10 yrs → 1.00  (and beyond)
+        3 yrs  → 0.55
     """
-    query = normalize_text(job.job_description)
-    bios  = [normalize_text(c.bio or "") for c in candidates]
- 
-    text_scores = compute_text_scores(query, bios)
- 
-    results: list[RankedWorker] = []
- 
-    for i, candidate in enumerate(candidates):
- 
-        # Proximity — 0.0 if worker has no stored coordinates
-        if candidate.address_lat is not None and candidate.address_lng is not None:
-            dist_km = haversine_km(
-                job.location_lat, job.location_lng,
-                candidate.address_lat, candidate.address_lng,
-            )
-            prox = proximity_score(dist_km)
-        else:
-            prox = 0.0
-            logger.debug(
-                "Worker %s has no coordinates — proximity score set to 0.0.",
-                candidate.worker_id,
-            )
- 
-        t_score = text_scores[i]
-        p_score = price_score(candidate.declared_rate, job.budget_min, job.budget_max)
-        r_score = rating_score(candidate.avg_rating)
- 
-        composite = (
-            WEIGHT_TEXT      * t_score
-            + WEIGHT_PROXIMITY * prox
-            + WEIGHT_PRICE     * p_score
-            + WEIGHT_RATING    * r_score
+    if years <= 0:
+        return 0.0
+    capped = min(int(years), EXPERIENCE_CAP_YEARS)
+    return round(math.sqrt(capped / EXPERIENCE_CAP_YEARS), 4)
+
+
+# ── Text relevance ─────────────────────────────────────────────────────────────
+
+def _build_query(job_type_name, resident_notes):
+    """
+    Primary query = admin-defined job type name (always present, always relevant).
+    Resident notes appended when provided for additional context.
+    This replaces the pure free-text description approach.
+    """
+    parts = [job_type_name.strip()] if job_type_name and job_type_name.strip() else []
+    if resident_notes and resident_notes.strip():
+        parts.append(resident_notes.strip())
+    return ' '.join(parts)
+
+
+def _text_scores(query, bios):
+    """
+    TF-IDF cosine similarity of query against each worker bio.
+    Workers with empty/missing bio receive 0.4 (below average but not zero)
+    so they appear in results but ranked below workers with relevant bios.
+    This is the bio-optional fallback described in scope discussion.
+    """
+    n = len(bios)
+    scores = [0.4] * n   # default for empty bios
+
+    if not query.strip():
+        return scores
+
+    # Only vectorize workers who have a non-empty bio
+    scored_idx  = [i for i, b in enumerate(bios) if b and b.strip()]
+    if not scored_idx:
+        return scores
+
+    corpus = [bios[i].lower() for i in scored_idx]
+    all_texts = [query.lower()] + corpus
+
+    try:
+        vec = TfidfVectorizer(
+            stop_words='english',
+            ngram_range=(1, 2),
+            min_df=1,
+            sublinear_tf=True,
         )
-        composite = max(0.0, min(1.0, composite))
- 
-        results.append(
-            RankedWorker(
-                worker_id=candidate.worker_id,
-                score=round(composite, 6),
-                score_breakdown={
-                    "text_score":      round(t_score, 6),
-                    "proximity_score": round(prox, 6),
-                    "price_score":     round(p_score, 6),
-                    "rating_score":    round(r_score, 6),
-                },
-            )
+        mat  = vec.fit_transform(all_texts)
+        sims = cosine_similarity(mat[0:1], mat[1:]).flatten()
+        for rank, orig_i in enumerate(scored_idx):
+            scores[orig_i] = round(float(sims[rank]), 4)
+    except Exception as exc:
+        logger.warning('TF-IDF failed: %s — using neutral scores', exc)
+
+    return scores
+
+
+# ── Main entry point ───────────────────────────────────────────────────────────
+
+def compute_matches(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    Compute and return a ranked list of workers by composite score.
+
+    Expected payload (Django → ML Service):
+    {
+        "job_request": {
+            "job_type_name":  str,          # name of the selected job type tile
+            "description":    str,          # optional resident notes
+            "budget_min":     float | null,
+            "budget_max":     float | null,
+            "location_lat":   float | null,
+            "location_lng":   float | null
+        },
+        "candidates": [
+            {
+                "worker_id":        str,
+                "declared_rate":    float,
+                "avg_rating":       float,
+                "years_experience": int,
+                "address_lat":      float | null,
+                "address_lng":      float | null,
+                "bio":              str | null   # optional
+            },
+            ...
+        ]
+    }
+    """
+    job   = payload['job_request']
+    cands = payload['candidates']
+
+    if not cands:
+        return []
+
+    job_lat       = job.get('location_lat')
+    job_lng       = job.get('location_lng')
+    budget_min    = job.get('budget_min')
+    budget_max    = job.get('budget_max')
+    job_type_name = job.get('job_type_name', '')
+    notes         = job.get('description', '')
+
+    query = _build_query(job_type_name, notes)
+    bios  = [str(c.get('bio') or '') for c in cands]
+    t_scores = _text_scores(query, bios)
+
+    results = []
+    for i, c in enumerate(cands):
+        t  = t_scores[i]
+        pr = _proximity_score(job_lat, job_lng, c.get('address_lat'), c.get('address_lng'))
+        p  = _price_score(budget_min, budget_max, float(c.get('declared_rate', 0)))
+        r  = _rating_score(float(c.get('avg_rating', 0)))
+        e  = _experience_score(int(c.get('years_experience', 0)))
+
+        composite = round(
+            WEIGHT_TEXT       * t  +
+            WEIGHT_PROXIMITY  * pr +
+            WEIGHT_PRICE      * p  +
+            WEIGHT_RATING     * r  +
+            WEIGHT_EXPERIENCE * e,
+            4
         )
- 
-    results.sort(key=lambda r: r.score, reverse=True)
+
+        results.append({
+            'worker_id': c['worker_id'],
+            'score':     composite,
+            'score_breakdown': {
+                'text_score':        t,
+                'proximity_score':   pr,
+                'price_score':       p,
+                'rating_score':      r,
+                'experience_score':  e,
+            },
+        })
+
+    results.sort(key=lambda x: x['score'], reverse=True)
     return results

@@ -1,43 +1,50 @@
 # Skill-Link-Cdo-ML / config.py
+# skilllink-ml / config.py
 #
-# Scoring Weight Configuration — Skill-Link CDO ML Service
-# RATIONALE FOR DEFAULT WEIGHTS:
-# ──────────────────────────────
-# Text relevance (0.35):
-#   Highest weight because the job type description + worker bio are the
-#   most semantically meaningful matching signals. The Admin-defined job
-#   type description removes free-text noise, making TF-IDF highly reliable.
+# Scoring weights and tuning parameters.
+# All values are configurable here without touching engine.py or main.py.
 #
-# Proximity (0.30):
-#   Second-highest. Barangay-scoped labor matching is inherently local.
-#   Residents strongly prefer workers nearby. Consistent with the design
-#   objective of reducing hiring friction within the community.
-#
-# Rating (0.20):
-#   Third. Average rating reflects demonstrated reliability across prior
-#   jobs. Weighted moderately — new workers with 0 ratings receive a
-#   neutral score (0.5) to avoid unfair penalization (see engine.py).
-#
-# Price (0.15):
-#   Lowest. Budget range is marked as a "soft signal".
-#   Residents may accept rates slightly outside their stated range.
-#   Overly penalizing price deviation would surface cheaper but unqualified
-#   workers over better-matched, slightly pricier ones.
+# Weight rules:
+#   - All five weights must sum to 1.0
+#   - Adjust per pilot feedback; re-deploy ML service only (Django untouched)
 
-WEIGHT_TEXT:      float = 0.35
-WEIGHT_PROXIMITY: float = 0.30
-WEIGHT_PRICE:     float = 0.15
-WEIGHT_RATING:    float = 0.20
- 
-assert abs((WEIGHT_TEXT + WEIGHT_PROXIMITY + WEIGHT_PRICE + WEIGHT_RATING) - 1.0) < 1e-9, (
-    f"Weights must sum to 1.0. Current sum: "
-    f"{WEIGHT_TEXT + WEIGHT_PROXIMITY + WEIGHT_PRICE + WEIGHT_RATING}"
-)
- 
-# Workers beyond this distance score 0.0 for proximity.
-# 15 km covers a single CDO barangay deployment generously.
-MAX_PROXIMITY_KM: float = 15.0
- 
-# Applied when ALL candidate bios are empty strings.
-# Slightly below neutral so workers without bios rank below those with bios.
-FALLBACK_TEXT_SCORE: float = 0.4
+import os
+
+# Scoring weights (must sum to 1.0) 
+#
+# Rationale for defaults:
+#   Experience (0.30) — highest weight per scope decision: experience is the
+#     primary trust signal for a barangay resident hiring without references.
+#   Rating (0.25)     — strong signal but requires prior jobs; new workers
+#     receive a neutral 0.5 so this does not unfairly exclude them early.
+#   Proximity (0.20)  — barangay-scale system; distance matters but a highly
+#     experienced worker 2km away should still beat a nearby inexperienced one.
+#   Price (0.15)      — soft signal per SRS; budget is a preference not a gate.
+#   Text (0.10)       — lowest weight because job_type_name is admin-defined
+#     and already category-scoped; bio is optional and may be absent.
+
+WEIGHT_EXPERIENCE : float = float(os.getenv('WEIGHT_EXPERIENCE', '0.30'))
+WEIGHT_RATING     : float = float(os.getenv('WEIGHT_RATING',     '0.25'))
+WEIGHT_PROXIMITY  : float = float(os.getenv('WEIGHT_PROXIMITY',  '0.20'))
+WEIGHT_PRICE      : float = float(os.getenv('WEIGHT_PRICE',      '0.15'))
+WEIGHT_TEXT       : float = float(os.getenv('WEIGHT_TEXT',       '0.10'))
+
+# Proximity decay 
+# Controls how fast the proximity score drops with distance.
+# score = e^(-km / PROXIMITY_DECAY_KM)
+#
+# At PROXIMITY_DECAY_KM = 3.0:
+#   0.0 km → 1.00    1.0 km → 0.72
+#   2.0 km → 0.51    3.0 km → 0.37
+#   5.0 km → 0.19   10.0 km → 0.04
+#
+# 3.0 km is appropriate for a single barangay pilot scope.
+# Increase to 5.0 or 8.0 when the system expands city-wide.
+PROXIMITY_DECAY_KM : float = float(os.getenv('PROXIMITY_DECAY_KM', '3.0'))
+
+# Experience cap 
+# Years at or beyond this value receive a full experience score of 1.0.
+# Workers below this are scored on a square-root curve.
+# Default 10 years: reflects the point where additional years yield
+# negligible practical differentiation for barangay-level jobs.
+EXPERIENCE_CAP_YEARS : int = int(os.getenv('EXPERIENCE_CAP_YEARS', '10'))
